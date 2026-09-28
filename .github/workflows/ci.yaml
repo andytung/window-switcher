@@ -7,6 +7,11 @@ on:
   push:
     branches:
     - main
+    - 'andytung/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 defaults:
   run:
@@ -28,22 +33,35 @@ jobs:
 
     env:
       RUSTFLAGS: --deny warnings
+      # Rust 1.98 adds Clippy diagnostics in unchanged upstream icon code.
+      RUSTUP_TOOLCHAIN: 1.97.0
 
     steps:
     - uses: actions/checkout@v6
 
     - name: Install Rust Toolchain Components
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
-
-    - uses: Swatinem/rust-cache@v2
+      run: |
+        rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+        rustup target add ${{ matrix.target }}
 
     - name: Test
-      run: cargo test --target=${{ matrix.target }} --all
+      run: cargo test --locked --target=${{ matrix.target }} --all
 
     - name: Clippy
-      run: cargo clippy --all --all-targets
+      run: cargo clippy --locked --all --all-targets
 
     - name: Format
       run: cargo fmt --all --check
+
+    - name: Build Windows executable
+      run: |
+        cargo build --locked --release --target=${{ matrix.target }}
+        mkdir -p dist
+        cp target/${{ matrix.target }}/release/window-switcher.exe window-switcher.ini LICENSE dist/
+
+    - name: Upload Windows executable and configuration
+      uses: actions/upload-artifact@v4
+      with:
+        name: window-switcher-windows-x64
+        path: dist/
+        if-no-files-found: error
