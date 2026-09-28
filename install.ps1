@@ -1,5 +1,5 @@
 $command = "window-switcher"
-$repo = "sigoden/$command"
+$repo = "andytung/$command"
 $url = "https://github.com/$repo"
 
 if ($env:OS -like "Windows*") {
@@ -22,7 +22,13 @@ if ($env:PROCESSOR_ARCHITECTURE -eq "x86") {
 
 $target = "$os-$arch"
 
-$tag = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" | select -Expand tag_name
+try {
+    $tag = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -ErrorAction Stop |
+        Select-Object -ExpandProperty tag_name
+} catch {
+    Write-Error "Unable to find a release for $repo. See $url#installation for source-build instructions. $($_.Exception.Message)"
+    exit 1
+}
 
 $dest = "C:\Users\$env:USERNAME\AppData\Local\Programs\$command"
 
