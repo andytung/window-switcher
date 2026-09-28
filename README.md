@@ -1,10 +1,8 @@
 # Window Switcher
 
-An independently maintained version of
-[sigoden/window-switcher](https://github.com/sigoden/window-switcher), with
-persistent window cycling, a single-key Alt shortcut, and app allowlist/denylist
-configuration. Changes are maintained here; using this version does not depend
-on an upstream pull request or merge.
+Forked from [sigoden/window-switcher](https://github.com/sigoden/window-switcher)
+and maintained independently, with persistent window cycling, a single-key Alt
+shortcut, and app allowlist/denylist configuration.
 
 Window Switcher runs on Windows. It switches between windows of the **same app**,
 with an optional separate shortcut for switching between apps.
