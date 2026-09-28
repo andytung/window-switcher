@@ -5,24 +5,26 @@ use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
-    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
-    is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
+    check_error, get_app_icon, get_foreground_window, get_window_pid, get_window_user_data,
+    is_iconic_window, is_running_as_admin, list_windows, set_foreground_window,
+    set_window_user_data,
 };
 use crate::window_cycle::WindowCycle;
+use crate::window_slots::{SlotWindow, WindowSlots, SLOT_COUNT};
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
-    Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW,
+        CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW, GetPropW,
         GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-        CW_USEDEFAULT, GWL_STYLE, HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
-        WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        RegisterWindowMessageW, RemovePropW, SetPropW, SetWindowLongPtrW, TranslateMessage,
+        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE, HICON, HTCLIENT, IDC_ARROW, MSG,
+        WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP,
+        WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     },
 };
 
@@ -35,6 +37,8 @@ pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
 pub const WM_USER_SWITCH_WINDOWS_TAP: u32 = 6022;
+pub const WM_USER_WINDOW_SLOT: u32 = 6023;
+const WINDOW_SLOT_PROPERTY: PCWSTR = w!("WindowSwitcher.ManualSlotIdentity");
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -54,6 +58,8 @@ pub struct App {
     startup: Startup,
     config: Config,
     switch_windows_state: WindowCycle,
+    window_slots: WindowSlots,
+    next_slot_marker: usize,
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
@@ -68,7 +74,11 @@ impl App {
             &config.switch_windows_denylist,
             &config.switch_windows_allowlist,
         )?;
-        let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
+        let _keyboard_listener = KeyboardListener::init(
+            hwnd,
+            &config.to_hotkeys(),
+            config.switch_windows_manual_slots,
+        )?;
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
@@ -87,6 +97,8 @@ impl App {
             startup,
             config: config.clone(),
             switch_windows_state: WindowCycle::default(),
+            window_slots: WindowSlots::default(),
+            next_slot_marker: 0,
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
@@ -263,6 +275,11 @@ impl App {
                     app.switch_windows_state.modifier_released = true;
                 }
             }
+            WM_USER_WINDOW_SLOT => {
+                let app = get_app(hwnd)?;
+                let handled = app.window_slot(wparam.0, lparam.0 == 1)?;
+                return Ok(LRESULT(isize::from(handled)));
+            }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
             }
@@ -305,6 +322,100 @@ impl App {
             _ => {}
         }
         Ok(unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
+    }
+
+    fn window_slot(&mut self, slot: usize, assign: bool) -> Result<bool> {
+        if slot >= SLOT_COUNT {
+            return Err(anyhow!("Invalid window slot: {slot}"));
+        }
+        if !self.config.switch_windows_manual_slots || self.switch_apps_state.is_some() {
+            return Ok(false);
+        }
+        self.window_slots.retain_live(is_slot_window_alive);
+        if !assign && self.window_slots.windows().next().is_none() {
+            return Ok(false);
+        }
+        let foreground = get_foreground_window();
+        if !is_window_allowed(foreground) {
+            return Ok(false);
+        }
+        let windows = list_windows(
+            self.config.switch_windows_ignore_minimal,
+            self.config.switch_windows_only_current_desktop(),
+            self.is_admin,
+        )?;
+        let Some((app, app_windows)) = windows
+            .iter()
+            .find(|(_, windows)| windows.iter().any(|(id, _)| *id == foreground))
+        else {
+            debug!("Foreground window is not eligible for manual slots");
+            return Ok(false);
+        };
+        let target = if assign {
+            foreground
+        } else if let Some(window) = self.window_slots.get(app, slot) {
+            HWND(window.handle as _)
+        } else {
+            return Ok(false);
+        };
+        if !is_window_allowed(target) || !app_windows.iter().any(|(id, _)| *id == target) {
+            debug!("Window slot F{} target is not currently eligible", slot + 1);
+            return Ok(false);
+        }
+
+        if assign {
+            let existing = self
+                .window_slots
+                .windows()
+                .find(|window| window.handle == foreground.0 as isize);
+            let window = match existing {
+                Some(window) => window,
+                None => {
+                    self.next_slot_marker = self
+                        .next_slot_marker
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("Window slot identity counter exhausted"))?;
+                    let window = SlotWindow {
+                        handle: foreground.0 as isize,
+                        process_id: get_window_pid(foreground),
+                        marker: self.next_slot_marker,
+                    };
+                    // Window properties disappear with the window, unlike reusable HWND values.
+                    unsafe {
+                        SetPropW(
+                            foreground,
+                            WINDOW_SLOT_PROPERTY,
+                            Some(HANDLE(window.marker as _)),
+                        )
+                    }
+                    .map_err(|err| anyhow!("Failed to assign window to F{}, {err}", slot + 1))?;
+                    window
+                }
+            };
+            if !is_slot_window_alive(window) {
+                return Err(anyhow!("Window closed while assigning F{}", slot + 1));
+            }
+            if let Some(previous) = self.window_slots.assign(app, slot, window) {
+                if !self.window_slots.windows().any(|window| window == previous) {
+                    remove_slot_window_property(previous);
+                }
+            }
+            info!("assigned {app} F{} to {foreground:?}", slot + 1);
+        } else {
+            // Recheck after enumeration: closing a window must never redirect a slot to a reused HWND.
+            let Some(window) = self.window_slots.get(app, slot) else {
+                return Ok(false);
+            };
+            if !is_slot_window_alive(window) {
+                self.window_slots.retain_live(is_slot_window_alive);
+                return Ok(false);
+            }
+            if get_foreground_window() != target && !set_foreground_window(target) {
+                error!("Failed to focus {app} window assigned to F{}", slot + 1);
+            }
+            self.switch_windows_state = WindowCycle::default();
+        }
+        Ok(true)
     }
 
     fn switch_windows(&mut self, hwnd: HWND, reverse: bool) -> Result<bool> {
@@ -442,10 +553,28 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        for window in self.window_slots.windows() {
+            remove_slot_window_property(window);
+        }
         for (_, icon) in self.cached_icons.drain() {
             unsafe {
                 let _ = DestroyIcon(icon);
             }
+        }
+    }
+}
+
+fn is_slot_window_alive(window: SlotWindow) -> bool {
+    let hwnd = HWND(window.handle as _);
+    window.marker != 0
+        && get_window_pid(hwnd) == window.process_id
+        && unsafe { GetPropW(hwnd, WINDOW_SLOT_PROPERTY).0 as usize == window.marker }
+}
+
+fn remove_slot_window_property(window: SlotWindow) {
+    if is_slot_window_alive(window) {
+        if let Err(err) = unsafe { RemovePropW(HWND(window.handle as _), WINDOW_SLOT_PROPERTY) } {
+            error!("Failed to remove window slot identity, {err}");
         }
     }
 }
@@ -463,4 +592,62 @@ fn get_app(hwnd: HWND) -> Result<&'static mut App> {
 pub struct SwitchAppsState {
     pub apps: Vec<(HICON, HWND)>,
     pub index: usize,
+}
+
+#[cfg(test)]
+mod window_slot_tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+
+    fn create_window() -> HWND {
+        unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("Window slot identity test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn slot_identity_expires_when_the_window_closes() {
+        let hwnd = create_window();
+        let window = SlotWindow {
+            handle: hwnd.0 as isize,
+            process_id: get_window_pid(hwnd),
+            marker: 1,
+        };
+        unsafe { SetPropW(hwnd, WINDOW_SLOT_PROPERTY, Some(HANDLE(window.marker as _))) }.unwrap();
+        assert!(is_slot_window_alive(window));
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+        assert!(!is_slot_window_alive(window));
+    }
+
+    #[test]
+    fn stale_identity_cannot_match_or_remove_a_new_window_identity() {
+        let hwnd = create_window();
+        let old = SlotWindow {
+            handle: hwnd.0 as isize,
+            process_id: get_window_pid(hwnd),
+            marker: 1,
+        };
+        let new = SlotWindow { marker: 2, ..old };
+        unsafe { SetPropW(hwnd, WINDOW_SLOT_PROPERTY, Some(HANDLE(new.marker as _))) }.unwrap();
+        assert!(!is_slot_window_alive(old));
+        remove_slot_window_property(old);
+        assert!(is_slot_window_alive(new));
+        remove_slot_window_property(new);
+        assert!(!is_slot_window_alive(new));
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
 }

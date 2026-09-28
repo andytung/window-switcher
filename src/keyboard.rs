@@ -3,10 +3,12 @@ use crate::{
     app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
         WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE, WM_USER_SWITCH_WINDOWS_TAP,
+        WM_USER_WINDOW_SLOT,
     },
     config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
     foreground::{is_foreground_allowed, is_window_allowed},
     utils::get_foreground_window,
+    window_slots::{function_key_slot, SlotAction, SlotKeyState},
 };
 
 use anyhow::{anyhow, Result};
@@ -22,7 +24,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY, VK_LMENU, VK_MENU,
+            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY, VK_CONTROL, VK_LMENU,
+            VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
             CallNextHookEx, PostMessageW, SendMessageTimeoutW, SetWindowsHookExW,
@@ -36,6 +39,9 @@ use windows::Win32::{
 static KEYBOARD_STATE: LazyLock<Mutex<Vec<HotKeyState>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static ALT_TAP: LazyLock<Mutex<AltTap>> = LazyLock::new(|| Mutex::new(AltTap::default()));
 static ALT_TAP_ENABLED: AtomicBool = AtomicBool::new(false);
+static MANUAL_SLOTS_ENABLED: AtomicBool = AtomicBool::new(false);
+static SLOT_KEYS: LazyLock<Mutex<SlotKeyState>> =
+    LazyLock::new(|| Mutex::new(SlotKeyState::default()));
 const MENU_MASK_TAG: usize = 0x57535450;
 static mut WINDOW: HWND = HWND(0 as _);
 static mut IS_SHIFT_PRESSED: bool = false;
@@ -49,11 +55,13 @@ pub struct KeyboardListener {
 }
 
 impl KeyboardListener {
-    pub fn init(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
+    pub fn init(hwnd: HWND, hotkeys: &[&Hotkey], manual_slots: bool) -> Result<Self> {
         unsafe { WINDOW = hwnd }
         let alt_tap_enabled = hotkeys.iter().any(|hotkey| hotkey.code.is_none());
         ALT_TAP_ENABLED.store(alt_tap_enabled, Ordering::Relaxed);
         *ALT_TAP.lock() = AltTap::default();
+        MANUAL_SLOTS_ENABLED.store(manual_slots, Ordering::Relaxed);
+        *SLOT_KEYS.lock() = SlotKeyState::default();
 
         let keyboard_state = hotkeys
             .iter()
@@ -168,6 +176,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&scan_code) {
         IS_SHIFT_PRESSED = is_key_pressed();
     }
+    if MANUAL_SLOTS_ENABLED.load(Ordering::Relaxed) {
+        if let Some(slot) = function_key_slot(kbd_data.vkCode) {
+            if handle_slot_key(slot, is_key_pressed()) {
+                return LRESULT(1);
+            }
+        }
+    }
     let mut keyboard_state = KEYBOARD_STATE.lock();
     let mut send_done_hotkeys: IndexSet<u32> = IndexSet::new();
     let mut send_action_message: Option<(u32, isize, bool)> = None;
@@ -251,6 +266,44 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     CallNextHookEx(None, code, w_param, l_param)
 }
 
+unsafe fn handle_slot_key(slot: usize, down: bool) -> bool {
+    if let Some(handled) = SLOT_KEYS.lock().existing_decision(slot, down) {
+        return handled;
+    }
+    let action = SlotAction::from_modifiers(
+        GetAsyncKeyState(VK_CONTROL.0 as i32) < 0,
+        GetAsyncKeyState(VK_LMENU.0 as i32) < 0,
+        GetAsyncKeyState(VK_RMENU.0 as i32) < 0,
+        GetAsyncKeyState(VK_SHIFT.0 as i32) < 0,
+        GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0,
+    );
+    let mut handled = false;
+    if let Some(action) = action {
+        if is_foreground_allowed() {
+            let mut result = 0;
+            let sent = SendMessageTimeoutW(
+                WINDOW,
+                WM_USER_WINDOW_SLOT,
+                WPARAM(slot),
+                LPARAM(isize::from(action == SlotAction::Assign)),
+                SMTO_ABORTIFHUNG,
+                500,
+                Some(&mut result),
+            );
+            if sent.0 == 0 {
+                error!("Failed to process manual window slot F{}", slot + 1);
+            } else {
+                handled = result != 0;
+                if handled && action == SlotAction::Assign {
+                    mask_alt_menu();
+                }
+            }
+        }
+    }
+    SLOT_KEYS.lock().remember(slot, handled);
+    handled
+}
+
 unsafe fn mask_alt_menu() -> bool {
     // An unassigned virtual key suppresses Alt's menu activation without a real shortcut.
     let key = KEYBDINPUT {
@@ -274,7 +327,7 @@ unsafe fn mask_alt_menu() -> bool {
         },
     ];
     if SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) != inputs.len() as u32 {
-        error!("Failed to suppress Alt menu activation; skipping window switch");
+        error!("Failed to suppress Alt menu activation");
         return false;
     }
     true

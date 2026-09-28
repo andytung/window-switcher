@@ -22,6 +22,7 @@ pub struct Config {
     pub switch_windows_denylist: HashSet<String>,
     pub switch_windows_allowlist: HashSet<String>,
     pub switch_windows_persistent_cycle: bool,
+    pub switch_windows_manual_slots: bool,
     pub switch_windows_ignore_minimal: bool,
     switch_windows_only_current_desktop: Option<bool>,
     pub switch_apps_enable: bool,
@@ -46,6 +47,7 @@ impl Default for Config {
             switch_windows_denylist: Default::default(),
             switch_windows_allowlist: Default::default(),
             switch_windows_persistent_cycle: false,
+            switch_windows_manual_slots: false,
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
             switch_apps_enable: false,
@@ -104,6 +106,10 @@ impl Config {
             if let Some(v) = section.get("persistent_cycle") {
                 conf.switch_windows_persistent_cycle = Config::to_bool(v)
                     .ok_or_else(|| anyhow!("Invalid switch windows persistent_cycle: {v}"))?;
+            }
+            if let Some(v) = section.get("manual_slots") {
+                conf.switch_windows_manual_slots = Config::to_bool(v)
+                    .ok_or_else(|| anyhow!("Invalid switch windows manual_slots: {v}"))?;
             }
             if let Some(v) = section.get("ignore_minimal").and_then(Config::to_bool) {
                 conf.switch_windows_ignore_minimal = v;
@@ -519,5 +525,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn manual_slots_are_opt_in_and_independent_of_cycling() {
+        for (value, expected) in [("yes", true), ("no", false)] {
+            let ini = Ini::load_from_str(&format!(
+                "[switch-windows]\nmanual_slots = {value}\nallowlist = code.exe",
+            ))
+            .unwrap();
+            let config = Config::load(&ini).unwrap();
+            assert_eq!(config.switch_windows_manual_slots, expected);
+            assert!(!config.switch_windows_persistent_cycle);
+            assert_eq!(
+                config.switch_windows_hotkey,
+                Config::default().switch_windows_hotkey
+            );
+            assert_eq!(
+                config.switch_windows_allowlist,
+                HashSet::from(["code.exe".into()])
+            );
+        }
+        assert!(!Config::default().switch_windows_manual_slots);
+    }
+
+    #[test]
+    fn invalid_manual_slot_option_is_reported() {
+        let ini = Ini::load_from_str("[switch-windows]\nmanual_slots = maybe").unwrap();
+        assert!(Config::load(&ini).is_err());
     }
 }

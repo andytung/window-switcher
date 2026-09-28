@@ -2,7 +2,7 @@
 
 Forked from [sigoden/window-switcher](https://github.com/sigoden/window-switcher)
 and maintained independently, with persistent window cycling, a single-key Alt
-shortcut, and app allowlist/denylist configuration.
+shortcut, manual F-key window assignments, and app allowlist/denylist configuration.
 
 Window Switcher runs on Windows. It switches between windows of the **same app**,
 with an optional separate shortcut for switching between apps.
@@ -79,6 +79,7 @@ All these settings belong in `[switch-windows]`.
 |---------|---------|----------|
 | `hotkey` | ``alt+` `` | Shortcut used to switch windows. |
 | `persistent_cycle` | `no` | Set to `yes` to continue the cycle across key releases. |
+| `manual_slots` | `no` | Enable manual Ctrl+Alt+Fn assignment and Fn recall for F1 through F24. |
 | `allowlist` | Empty | Exact executable names where window switching is enabled. Empty permits all apps. |
 | `denylist` | Empty | Executable names where window switching is disabled. Takes precedence over the allowlist. |
 | `ignore_minimal` | `no` | Set to `yes` to exclude minimized windows. |
@@ -117,7 +118,45 @@ Right Alt is not a tap shortcut, preserving AltGr.
 
 Inside enabled apps, a bare left-Alt tap replaces native menu activation.
 Outside the allowlist or inside the denylist, Alt behaves normally.
-Arbitrary standalone keys other than left Alt are not supported.
+Arbitrary standalone keys other than left Alt are not supported by `hotkey`.
+Manual F-key assignments use the separate `manual_slots` setting below.
+
+### Manual F-key assignments
+
+Enable this independently of the cycling shortcut:
+
+```ini
+[switch-windows]
+manual_slots = yes
+allowlist = chrome.exe,code.exe,notepad.exe
+denylist =
+```
+
+Focus a window and press **Ctrl+left Alt+F1** to assign it to F1. Focus another
+window and press **Ctrl+left Alt+F2** to assign it to F2. Afterwards, press **F1**
+or **F2** alone to jump directly to that window. F1 through F24 are supported.
+Right Alt is not an assignment modifier, so AltGr combinations remain available.
+
+Assignments are per app, not global: Chrome and VS Code can each have their own
+F1 window. Slots use the same app grouping as normal cycling, so browser profiles
+and installed web apps can have separate assignments.
+
+- Nothing is assigned automatically. An unassigned F-key keeps its normal app
+  behavior.
+- Assigning an occupied slot replaces only that slot. Other assignments do not
+  move when focus changes, new windows open, or another slot is reassigned.
+- Closing a window loses all its assignments. New windows never inherit them,
+  even if Windows reuses the closed window's internal handle.
+- Assignments are kept only in memory. Exiting or restarting Window Switcher
+  clears them; there are no saved mappings or title-matching rules.
+- The allowlist, denylist, minimized-window filter, and virtual-desktop setting
+  also apply to manual slots. An assigned but currently excluded window retains
+  its assignment, but its F-key passes through until the window is eligible.
+
+Holding an assignment or recall key performs its action once, not repeatedly.
+Other modified F-key combinations keep their existing behavior. Manual slot
+shortcuts take precedence over conflicting cycling shortcuts when a slot action
+can be performed. Regular cycling remains available and never assigns slots.
 
 ### App filtering and compatibility
 
@@ -129,8 +168,8 @@ denied.
 The legacy name `blacklist` remains accepted when `denylist` is absent. An
 explicit `denylist`, even empty, overrides the legacy setting.
 
-Filtering and persistent cycling affect same-app window switching only. They
-do not change the separate `[switch-apps]` feature.
+Filtering, persistent cycling, and manual slots affect same-app window switching
+only. They do not change the separate `[switch-apps]` feature.
 
 ### Other settings
 

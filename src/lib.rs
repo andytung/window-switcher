@@ -13,6 +13,7 @@ mod painter;
 mod startup;
 mod trayicon;
 mod window_cycle;
+mod window_slots;
 
 pub use crate::app::start;
 pub use crate::config::{load_config, Config};
