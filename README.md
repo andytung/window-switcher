@@ -36,9 +36,30 @@ denylist =
 
 ## Installation
 
-**There is no prebuilt download for this version yet.** Upstream releases, the
-upstream installer, and the Scoop package do not contain these changes. For now,
-build this repository on Windows.
+### Download for Windows
+
+Download the [Windows x64 preview ZIP](https://github.com/andytung/window-switcher/releases/download/v1.19.0-manual-slots.2/window-switcher-v1.19.0-manual-slots.2-windows-64.zip)
+from [this repository's releases](https://github.com/andytung/window-switcher/releases).
+**You do not need Git, Rust, or Visual Studio to run it.**
+
+1. Extract the ZIP into a folder of your choice. Keep `window-switcher.exe`,
+   `window-switcher.ini`, and `LICENSE` together.
+2. Edit the INI before launching. For manual F-key assignments, set
+   `manual_slots = yes` under `[switch-windows]`. For repeated cycling across
+   releases, set `persistent_cycle = yes`. Use `hotkey = alt` for left Alt alone.
+3. Double-click `window-switcher.exe`. Its icon appears in the system tray.
+4. After editing the configuration, exit Window Switcher using its tray menu and
+   launch it again. A Windows restart is not necessary. Restarting Window
+   Switcher clears manual assignments.
+
+To update, exit the running copy, replace the EXE, and keep your existing INI
+instead of overwriting your settings. Assignments must be made again after
+restarting.
+
+This is an unsigned preview build for 64-bit Intel/AMD Windows. Windows may
+display a security warning; follow your device's security policy. Native ARM64
+and 32-bit builds are not included. Upstream releases and the Scoop package do
+not contain this version's additions.
 
 ### Build from source on Windows
 
@@ -61,9 +82,9 @@ launch `target\release\window-switcher.exe`. The executable is portable: you can
 copy it and the INI together to a folder of your choice. No installer is required.
 Exit any running copy before launching a replacement.
 
-The repository's `install.ps1` targets releases of **this repository**, not
-upstream. It will not work until a release is published; use the source-build
-instructions above in the meantime.
+The repository's `install.ps1` targets stable releases of **this repository**,
+not upstream. It does not select preview releases; use the ZIP download above
+for this preview.
 
 ## Configuration reference
 
