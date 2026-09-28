@@ -1,5 +1,5 @@
 use crate::config::{edit_config_file, Config};
-use crate::foreground::ForegroundWatcher;
+use crate::foreground::{is_window_allowed, ForegroundWatcher};
 use crate::keyboard::KeyboardListener;
 use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
@@ -8,9 +8,9 @@ use crate::utils::{
     check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
     is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
 };
+use crate::window_cycle::WindowCycle;
 
 use anyhow::{anyhow, Result};
-use indexmap::IndexSet;
 use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
@@ -34,6 +34,7 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+pub const WM_USER_SWITCH_WINDOWS_TAP: u32 = 6022;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -52,7 +53,7 @@ pub struct App {
     trayicon: Option<TrayIcon>,
     startup: Startup,
     config: Config,
-    switch_windows_state: SwitchWindowsState,
+    switch_windows_state: WindowCycle,
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
@@ -63,7 +64,10 @@ impl App {
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
-        let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
+        let _foreground_watcher = ForegroundWatcher::init(
+            &config.switch_windows_denylist,
+            &config.switch_windows_allowlist,
+        )?;
         let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
 
         let trayicon = match config.trayicon {
@@ -82,10 +86,7 @@ impl App {
             trayicon,
             startup,
             config: config.clone(),
-            switch_windows_state: SwitchWindowsState {
-                cache: None,
-                modifier_released: true,
-            },
+            switch_windows_state: WindowCycle::default(),
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
@@ -254,6 +255,14 @@ impl App {
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
             }
+            WM_USER_SWITCH_WINDOWS_TAP => {
+                let app = get_app(hwnd)?;
+                let source = HWND(wparam.0 as _);
+                if get_foreground_window() == source {
+                    app.switch_windows(source, false)?;
+                    app.switch_windows_state.modifier_released = true;
+                }
+            }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
             }
@@ -299,6 +308,10 @@ impl App {
     }
 
     fn switch_windows(&mut self, hwnd: HWND, reverse: bool) -> Result<bool> {
+        if !is_window_allowed(hwnd) {
+            self.switch_windows_state = WindowCycle::default();
+            return Ok(false);
+        }
         let windows = list_windows(
             self.config.switch_windows_ignore_minimal,
             self.config.switch_windows_only_current_desktop(),
@@ -314,67 +327,25 @@ impl App {
             .map(|(k, _)| k.clone())
         {
             Some(v) => v,
-            None => return Ok(false),
+            None => {
+                self.switch_windows_state = WindowCycle::default();
+                return Ok(false);
+            }
         };
         match windows.get(&module_path) {
             None => Ok(false),
             Some(windows) => {
-                let windows_len = windows.len();
-                if windows_len == 1 {
+                let window_ids: Vec<isize> = windows.iter().map(|(id, _)| id.0 as isize).collect();
+                let Some(target) = self.switch_windows_state.next(
+                    &module_path,
+                    &window_ids,
+                    hwnd.0 as isize,
+                    reverse,
+                    self.config.switch_windows_persistent_cycle,
+                ) else {
                     return Ok(false);
-                }
-                let current_id = windows[0].0;
-                let mut index = 1;
-                let mut state_id = current_id;
-                let mut state_windows = vec![];
-                if windows_len > 2 {
-                    if let Some((cache_module_path, cache_id, cache_index, cache_windows)) =
-                        self.switch_windows_state.cache.as_ref()
-                    {
-                        if cache_module_path == &module_path {
-                            if self.switch_windows_state.modifier_released {
-                                if *cache_id != current_id {
-                                    if let Some((i, _)) =
-                                        windows.iter().enumerate().find(|(_, (v, _))| v == cache_id)
-                                    {
-                                        index = i;
-                                    }
-                                }
-                            } else {
-                                state_id = *cache_id;
-                                let mut windows_set: IndexSet<isize> =
-                                    windows.iter().map(|(v, _)| v.0 as _).collect();
-                                for id in cache_windows {
-                                    if windows_set.contains(id) {
-                                        state_windows.push(*id);
-                                        windows_set.swap_remove(id);
-                                    }
-                                }
-                                state_windows.extend(windows_set);
-                                index = if reverse {
-                                    if *cache_index == 0 {
-                                        windows_len - 1
-                                    } else {
-                                        cache_index - 1
-                                    }
-                                } else if *cache_index >= windows_len - 1 {
-                                    0
-                                } else {
-                                    cache_index + 1
-                                };
-                            }
-                        }
-                    }
-                }
-                if state_windows.is_empty() {
-                    state_windows = windows.iter().map(|(v, _)| v.0 as _).collect();
-                }
-                let hwnd = HWND(state_windows[index] as _);
-                self.switch_windows_state = SwitchWindowsState {
-                    cache: Some((module_path.clone(), state_id, index, state_windows)),
-                    modifier_released: false,
                 };
-                set_foreground_window(hwnd);
+                set_foreground_window(HWND(target as _));
 
                 Ok(true)
             }
@@ -486,12 +457,6 @@ fn get_app(hwnd: HWND) -> Result<&'static mut App> {
         let tx: &mut App = &mut *(ptr as *mut App);
         Ok(tx)
     }
-}
-
-#[derive(Debug)]
-struct SwitchWindowsState {
-    cache: Option<(String, HWND, usize, Vec<isize>)>,
-    modifier_released: bool,
 }
 
 #[derive(Debug)]

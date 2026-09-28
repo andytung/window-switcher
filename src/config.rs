@@ -19,7 +19,9 @@ pub struct Config {
     pub log_level: LevelFilter,
     pub log_file: Option<PathBuf>,
     pub switch_windows_hotkey: Vec<Hotkey>,
-    pub switch_windows_blacklist: HashSet<String>,
+    pub switch_windows_denylist: HashSet<String>,
+    pub switch_windows_allowlist: HashSet<String>,
+    pub switch_windows_persistent_cycle: bool,
     pub switch_windows_ignore_minimal: bool,
     switch_windows_only_current_desktop: Option<bool>,
     pub switch_apps_enable: bool,
@@ -41,7 +43,9 @@ impl Default for Config {
                 "alt + `",
             )
             .unwrap()],
-            switch_windows_blacklist: Default::default(),
+            switch_windows_denylist: Default::default(),
+            switch_windows_allowlist: Default::default(),
+            switch_windows_persistent_cycle: false,
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
             switch_apps_enable: false,
@@ -91,12 +95,15 @@ impl Config {
                 }
             }
 
-            if let Some(v) = section
-                .get("blacklist")
-                .map(normalize_path_value)
-                .map(|v| v.split(',').map(|v| v.trim().to_string()).collect())
-            {
-                conf.switch_windows_blacklist = v;
+            if let Some(v) = section.get("denylist").or_else(|| section.get("blacklist")) {
+                conf.switch_windows_denylist = parse_app_list(v);
+            }
+            if let Some(v) = section.get("allowlist") {
+                conf.switch_windows_allowlist = parse_app_list(v);
+            }
+            if let Some(v) = section.get("persistent_cycle") {
+                conf.switch_windows_persistent_cycle = Config::to_bool(v)
+                    .ok_or_else(|| anyhow!("Invalid switch windows persistent_cycle: {v}"))?;
             }
             if let Some(v) = section.get("ignore_minimal").and_then(Config::to_bool) {
                 conf.switch_windows_ignore_minimal = v;
@@ -191,13 +198,18 @@ pub struct Hotkey {
     pub id: u32,
     pub name: String,
     pub modifier: [u32; 2],
-    pub code: u32,
+    pub code: Option<u32>,
 }
 
 impl Hotkey {
     pub fn create(id: u32, name: &str, value: &str) -> Result<Self> {
         let (modifier, code) =
             Self::parse(value).ok_or_else(|| anyhow!("Invalid {name} hotkey"))?;
+        if code.is_none() && id != SWITCH_WINDOWS_HOTKEY_ID {
+            return Err(anyhow!(
+                "Alt-only hotkeys are only supported for switch windows"
+            ));
+        }
         Ok(Self {
             id,
             name: name.to_string(),
@@ -210,11 +222,14 @@ impl Hotkey {
         self.modifier[0]
     }
 
-    pub fn parse(value: &str) -> Option<([u32; 2], u32)> {
+    pub fn parse(value: &str) -> Option<([u32; 2], Option<u32>)> {
         let value = value
             .to_ascii_lowercase()
             .replace(' ', "")
             .replace("vk_", "");
+        if value == "alt" {
+            return Some(([0x38, 0x38], None));
+        }
         let keys: Vec<&str> = value.split('+').collect();
         if keys.len() != 2 {
             return None;
@@ -311,7 +326,7 @@ impl Hotkey {
             "menu" => 0x5d,
             _ => return None,
         };
-        Some((modifier, code))
+        Some((modifier, Some(code)))
     }
 }
 
@@ -321,8 +336,18 @@ pub fn load_config() -> Result<Config> {
         enabled_escape: false,
         ..Default::default()
     };
-    let conf = Ini::load_from_file_opt(&filepath, opt)
-        .map_err(|err| anyhow!("Failed to load config file '{}', {err}", filepath.display()))?;
+    let conf = match Ini::load_from_file_opt(&filepath, opt) {
+        Ok(conf) => conf,
+        Err(ini::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(err) => {
+            return Err(anyhow!(
+                "Failed to load config file '{}', {err}",
+                filepath.display()
+            ));
+        }
+    };
     Config::load(&conf)
 }
 
@@ -362,6 +387,15 @@ fn normalize_path_value(value: &str) -> String {
     value.replace("\\\\", "\\")
 }
 
+fn parse_app_list(value: &str) -> HashSet<String> {
+    normalize_path_value(value)
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
 fn parse_hotkeys(id: u32, name: &str, value: &str) -> Result<Vec<Hotkey>> {
     let parts: Vec<&str> = value.split("||").collect();
     let mut hotkeys = vec![];
@@ -384,8 +418,11 @@ mod tests {
 
     #[test]
     fn test_hotkey() {
-        assert_eq!(Hotkey::parse("alt + `"), Some(([0x38, 0x38], 0x29)));
-        assert_eq!(Hotkey::parse("alt + tab"), Some(([0x38, 0x38], 0x0f)));
+        assert_eq!(Hotkey::parse("alt + `"), Some(([0x38, 0x38], Some(0x29))));
+        assert_eq!(Hotkey::parse("alt + tab"), Some(([0x38, 0x38], Some(0x0f))));
+        assert_eq!(Hotkey::parse(" ALT "), Some(([0x38, 0x38], None)));
+        assert!(Hotkey::parse("ctrl").is_none());
+        assert!(Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt").is_err());
     }
 
     #[test]
@@ -393,13 +430,94 @@ mod tests {
         let hotkeys = parse_hotkeys(1, "test", "alt+` || alt+tab").unwrap();
         assert_eq!(hotkeys.len(), 2);
         assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
-        assert_eq!(hotkeys[0].code, 0x29);
+        assert_eq!(hotkeys[0].code, Some(0x29));
         assert_eq!(hotkeys[1].modifier, [0x38, 0x38]);
-        assert_eq!(hotkeys[1].code, 0x0f);
+        assert_eq!(hotkeys[1].code, Some(0x0f));
 
         let hotkeys = parse_hotkeys(1, "test", "alt+`").unwrap();
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
-        assert_eq!(hotkeys[0].code, 0x29);
+        assert_eq!(hotkeys[0].code, Some(0x29));
+    }
+
+    #[test]
+    fn default_ini_preserves_defaults() {
+        let ini = Ini::load_from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(Config::load(&ini).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn persistent_alt_tap_with_allowlist() {
+        let ini = Ini::load_from_str(
+            "[switch-windows]\nhotkey = alt || alt+`\npersistent_cycle = yes\n\
+             allowlist = Notepad.exe, , CODE.EXE,\ndenylist = game.exe",
+        )
+        .unwrap();
+        let config = Config::load(&ini).unwrap();
+        assert!(config.switch_windows_persistent_cycle);
+        assert_eq!(config.switch_windows_hotkey.len(), 2);
+        assert_eq!(config.switch_windows_hotkey[0].code, None);
+        assert_eq!(config.switch_windows_hotkey[1].code, Some(0x29));
+        assert_eq!(
+            config.switch_windows_allowlist,
+            HashSet::from(["notepad.exe".into(), "code.exe".into(),])
+        );
+        assert_eq!(
+            config.switch_windows_denylist,
+            HashSet::from(["game.exe".into()])
+        );
+        assert!(!config.switch_apps_enable);
+    }
+
+    #[test]
+    fn invalid_cycle_option_is_reported() {
+        let ini = Ini::load_from_str("[switch-windows]\npersistent_cycle = maybe").unwrap();
+        assert!(Config::load(&ini).is_err());
+    }
+
+    #[test]
+    fn legacy_denylist_name_is_still_accepted() {
+        let ini = Ini::load_from_str("[switch-windows]\nblacklist = GAME.EXE, ").unwrap();
+        assert_eq!(
+            Config::load(&ini).unwrap().switch_windows_denylist,
+            HashSet::from(["game.exe".into()])
+        );
+    }
+
+    #[test]
+    fn explicit_denylist_overrides_legacy_name_even_when_empty() {
+        for (value, expected) in [
+            ("new.exe", HashSet::from(["new.exe".into()])),
+            ("", HashSet::new()),
+        ] {
+            let ini = Ini::load_from_str(&format!(
+                "[switch-windows]\nblacklist = old.exe\ndenylist = {value}"
+            ))
+            .unwrap();
+            assert_eq!(
+                Config::load(&ini).unwrap().switch_windows_denylist,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_option_is_independent_of_hotkey() {
+        for hotkey in ["alt", "alt+`", "ctrl+space", "win+tab"] {
+            for (value, expected) in [("yes", true), ("no", false)] {
+                let ini = Ini::load_from_str(&format!(
+                    "[switch-windows]\nhotkey = {hotkey}\npersistent_cycle = {value}"
+                ))
+                .unwrap();
+                let config = Config::load(&ini).unwrap();
+                assert_eq!(config.switch_windows_persistent_cycle, expected);
+                assert_eq!(
+                    config.switch_windows_hotkey,
+                    vec![
+                        Hotkey::create(SWITCH_WINDOWS_HOTKEY_ID, "switch windows", hotkey).unwrap()
+                    ],
+                );
+            }
+        }
     }
 }

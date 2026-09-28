@@ -1,29 +1,42 @@
 use crate::{
+    alt_tap::AltTap,
     app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
-        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE, WM_USER_SWITCH_WINDOWS_TAP,
     },
     config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
-    foreground::IS_FOREGROUND_IN_BLACKLIST,
+    foreground::{is_foreground_allowed, is_window_allowed},
+    utils::get_foreground_window,
 };
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
 use parking_lot::Mutex;
-use std::sync::LazyLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    LazyLock,
+};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Input::KeyboardAndMouse::{SCANCODE_LSHIFT, SCANCODE_RSHIFT},
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+            KEYEVENTF_KEYUP, SCANCODE_LSHIFT, SCANCODE_RSHIFT, VIRTUAL_KEY, VK_LMENU, VK_MENU,
+        },
         WindowsAndMessaging::{
-            CallNextHookEx, SendMessageTimeoutW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-            KBDLLHOOKSTRUCT, LLKHF_UP, SMTO_ABORTIFHUNG, WH_KEYBOARD_LL,
+            CallNextHookEx, PostMessageW, SendMessageTimeoutW, SetWindowsHookExW,
+            UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_UP,
+            SMTO_ABORTIFHUNG, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+            WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
         },
     },
 };
 
 static KEYBOARD_STATE: LazyLock<Mutex<Vec<HotKeyState>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static ALT_TAP: LazyLock<Mutex<AltTap>> = LazyLock::new(|| Mutex::new(AltTap::default()));
+static ALT_TAP_ENABLED: AtomicBool = AtomicBool::new(false);
+const MENU_MASK_TAG: usize = 0x57535450;
 static mut WINDOW: HWND = HWND(0 as _);
 static mut IS_SHIFT_PRESSED: bool = false;
 static mut IS_SWITCHING_APPS: bool = false;
@@ -32,11 +45,15 @@ static mut PREVIOUS_KEYCODE: u32 = 0;
 #[derive(Debug)]
 pub struct KeyboardListener {
     hook: HHOOK,
+    mouse_hook: HHOOK,
 }
 
 impl KeyboardListener {
     pub fn init(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
         unsafe { WINDOW = hwnd }
+        let alt_tap_enabled = hotkeys.iter().any(|hotkey| hotkey.code.is_none());
+        ALT_TAP_ENABLED.store(alt_tap_enabled, Ordering::Relaxed);
+        *ALT_TAP.lock() = AltTap::default();
 
         let keyboard_state = hotkeys
             .iter()
@@ -58,9 +75,20 @@ impl KeyboardListener {
             )
         }
         .map_err(|err| anyhow!("Failed to set windows hook, {err}"))?;
+        let mut listener = Self {
+            hook,
+            mouse_hook: HHOOK::default(),
+        };
+        if alt_tap_enabled {
+            let hinstance = unsafe { GetModuleHandleW(None) }?;
+            listener.mouse_hook = unsafe {
+                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hinstance.into()), 0)
+            }
+            .map_err(|err| anyhow!("Failed to watch mouse input for Alt taps, {err}"))?;
+        }
         info!("keyboard listener start");
 
-        Ok(Self { hook })
+        Ok(listener)
     }
 }
 
@@ -69,6 +97,9 @@ impl Drop for KeyboardListener {
         debug!("keyboard listener destroyed");
         if !self.hook.is_invalid() {
             let _ = unsafe { UnhookWindowsHookEx(self.hook) };
+        }
+        if !self.mouse_hook.is_invalid() {
+            let _ = unsafe { UnhookWindowsHookEx(self.mouse_hook) };
         }
     }
 }
@@ -93,11 +124,47 @@ unsafe fn send_message_timeout(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if code < 0 {
+        return CallNextHookEx(None, code, w_param, l_param);
+    }
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
+    if kbd_data.dwExtraInfo == MENU_MASK_TAG {
+        return CallNextHookEx(None, code, w_param, l_param);
+    }
     debug!("keyboard {kbd_data:?}");
     let mut is_modifier = false;
     let scan_code = kbd_data.scanCode;
     let is_key_pressed = || kbd_data.flags.0 & LLKHF_UP.0 == 0;
+    if ALT_TAP_ENABLED.load(Ordering::Relaxed) {
+        let left_alt =
+            kbd_data.vkCode == VK_LMENU.0 as u32 && kbd_data.flags.0 & LLKHF_INJECTED.0 == 0;
+        let foreground = if left_alt {
+            let hwnd = get_foreground_window();
+            is_window_allowed(hwnd).then_some(hwnd.0 as isize)
+        } else {
+            None
+        };
+        let other_keys_down = left_alt
+            && (1..=254).any(|key| {
+                key != VK_MENU.0 as i32 && key != VK_LMENU.0 as i32 && GetAsyncKeyState(key) < 0
+            });
+        let tap = ALT_TAP
+            .lock()
+            .update(left_alt, is_key_pressed(), foreground, other_keys_down);
+        if tap && mask_alt_menu() {
+            // Defer switching until the original Alt-up has passed through the hook.
+            if let Some(source) = foreground {
+                if let Err(err) = PostMessageW(
+                    Some(WINDOW),
+                    WM_USER_SWITCH_WINDOWS_TAP,
+                    WPARAM(source as usize),
+                    LPARAM(0),
+                ) {
+                    error!("Failed to queue Alt-tap window switch, {err}");
+                }
+            }
+        }
+    }
     if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&scan_code) {
         IS_SHIFT_PRESSED = is_key_pressed();
     }
@@ -106,13 +173,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let mut send_action_message: Option<(u32, isize, bool)> = None;
 
     for state in keyboard_state.iter_mut() {
+        if state.hotkey.code.is_none() {
+            continue;
+        }
         if state.hotkey.modifier.contains(&scan_code) {
             is_modifier = true;
             if is_key_pressed() {
                 state.is_modifier_pressed = true;
             } else {
                 state.is_modifier_pressed = false;
-                if PREVIOUS_KEYCODE == state.hotkey.code {
+                if Some(PREVIOUS_KEYCODE) == state.hotkey.code {
                     send_done_hotkeys.insert(state.hotkey.id);
                 }
             }
@@ -122,10 +192,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
         for state in keyboard_state.iter_mut() {
             if is_key_pressed() && state.is_modifier_pressed {
                 let id = state.hotkey.id;
-                if scan_code == state.hotkey.code {
+                if Some(scan_code) == state.hotkey.code {
                     let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
                     if id == SWITCH_APPS_HOTKEY_ID
-                        || (id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST)
+                        || (id == SWITCH_WINDOWS_HOTKEY_ID && is_foreground_allowed())
                     {
                         send_action_message = Some((id, reverse, false));
                         PREVIOUS_KEYCODE = scan_code;
@@ -177,6 +247,52 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
             IS_SWITCHING_APPS = false;
             return LRESULT(1);
         }
+    }
+    CallNextHookEx(None, code, w_param, l_param)
+}
+
+unsafe fn mask_alt_menu() -> bool {
+    // An unassigned virtual key suppresses Alt's menu activation without a real shortcut.
+    let key = KEYBDINPUT {
+        wVk: VIRTUAL_KEY(0xe8),
+        dwExtraInfo: MENU_MASK_TAG,
+        ..Default::default()
+    };
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: key },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    dwFlags: KEYEVENTF_KEYUP,
+                    ..key
+                },
+            },
+        },
+    ];
+    if SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) != inputs.len() as u32 {
+        error!("Failed to suppress Alt menu activation; skipping window switch");
+        return false;
+    }
+    true
+}
+
+unsafe extern "system" fn mouse_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if code >= 0
+        && matches!(
+            w_param.0 as u32,
+            WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_XBUTTONDOWN
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+        )
+    {
+        ALT_TAP.lock().cancel();
     }
     CallNextHookEx(None, code, w_param, l_param)
 }

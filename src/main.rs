@@ -22,7 +22,7 @@ fn run() -> Result<()> {
         );
     }
 
-    let config = load_config().unwrap_or_default();
+    let config = load_config()?;
     if let Some(log_file) = &config.log_file {
         let file = prepare_log_file(log_file).map_err(|err| {
             anyhow!(
