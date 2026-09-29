@@ -395,12 +395,16 @@ impl App {
             if !is_slot_window_alive(window) {
                 return Err(anyhow!("Window closed while assigning F{}", slot + 1));
             }
-            if let Some(previous) = self.window_slots.assign(app, slot, window) {
+            if let Some(previous) = self.window_slots.toggle_assignment(app, slot, window) {
                 if !self.window_slots.windows().any(|window| window == previous) {
                     remove_slot_window_property(previous);
                 }
             }
-            info!("assigned {app} F{} to {foreground:?}", slot + 1);
+            if self.window_slots.get(app, slot).is_some() {
+                info!("assigned {app} F{} to {foreground:?}", slot + 1);
+            } else {
+                info!("unassigned {app} F{} from {foreground:?}", slot + 1);
+            }
         } else {
             // Recheck after enumeration: closing a window must never redirect a slot to a reused HWND.
             let Some(window) = self.window_slots.get(app, slot) else {

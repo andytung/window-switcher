@@ -22,6 +22,25 @@ impl WindowSlots {
             .insert(slot, window)
     }
 
+    pub fn toggle_assignment(
+        &mut self,
+        app: &str,
+        slot: usize,
+        window: SlotWindow,
+    ) -> Option<SlotWindow> {
+        let app = app.to_lowercase();
+        if let Some(slots) = self.apps.get_mut(&app) {
+            if slots.get(&slot) == Some(&window) {
+                let previous = slots.remove(&slot);
+                if slots.is_empty() {
+                    self.apps.remove(&app);
+                }
+                return previous;
+            }
+        }
+        self.assign(&app, slot, window)
+    }
+
     pub fn get(&self, app: &str, slot: usize) -> Option<SlotWindow> {
         self.apps.get(&app.to_lowercase())?.get(&slot).copied()
     }
@@ -140,6 +159,79 @@ mod tests {
         assert_eq!(slots.assign("app.exe", 0, window(3)), Some(window(1)));
         assert_eq!(slots.get("app.exe", 0), Some(window(3)));
         assert_eq!(slots.get("app.exe", 1), Some(window(2)));
+    }
+
+    #[test]
+    fn repeating_assignment_toggles_the_same_window_off_and_on() {
+        let mut slots = WindowSlots::default();
+        assert_eq!(slots.toggle_assignment("app.exe", 0, window(1)), None);
+        assert_eq!(slots.get("app.exe", 0), Some(window(1)));
+        assert_eq!(
+            slots.toggle_assignment("APP.EXE", 0, window(1)),
+            Some(window(1))
+        );
+        assert_eq!(slots.get("app.exe", 0), None);
+        assert!(slots.apps.is_empty());
+        assert_eq!(slots.toggle_assignment("app.exe", 0, window(1)), None);
+        assert_eq!(slots.get("app.exe", 0), Some(window(1)));
+    }
+
+    #[test]
+    fn toggling_a_different_window_replaces_the_assignment() {
+        let mut slots = WindowSlots::default();
+        slots.toggle_assignment("app.exe", 0, window(1));
+        assert_eq!(
+            slots.toggle_assignment("app.exe", 0, window(2)),
+            Some(window(1))
+        );
+        assert_eq!(slots.get("app.exe", 0), Some(window(2)));
+    }
+
+    #[test]
+    fn clearing_one_slot_preserves_other_slots_and_window_references() {
+        let mut slots = WindowSlots::default();
+        slots.assign("app.exe", 0, window(1));
+        slots.assign("app.exe", 1, window(1));
+        slots.assign("other.exe", 0, window(2));
+        assert_eq!(
+            slots.toggle_assignment("app.exe", 0, window(1)),
+            Some(window(1))
+        );
+        assert_eq!(slots.get("app.exe", 0), None);
+        assert_eq!(slots.get("app.exe", 1), Some(window(1)));
+        assert_eq!(slots.get("other.exe", 0), Some(window(2)));
+        assert!(slots.windows().any(|entry| entry == window(1)));
+        slots.toggle_assignment("app.exe", 1, window(1));
+        assert!(!slots.windows().any(|entry| entry == window(1)));
+    }
+
+    #[test]
+    fn a_new_window_lifetime_is_reassigned_not_toggled_off() {
+        let mut slots = WindowSlots::default();
+        let old = window(1);
+        let replacement = SlotWindow { marker: 99, ..old };
+        slots.assign("app.exe", 0, old);
+        assert_eq!(
+            slots.toggle_assignment("app.exe", 0, replacement),
+            Some(old)
+        );
+        assert_eq!(slots.get("app.exe", 0), Some(replacement));
+    }
+
+    #[test]
+    fn key_repeat_does_not_toggle_an_assignment_multiple_times() {
+        let mut slots = WindowSlots::default();
+        let mut keys = SlotKeyState::default();
+        for expected in [Some(window(1)), None] {
+            assert_eq!(keys.existing_decision(0, true), None);
+            slots.toggle_assignment("app.exe", 0, window(1));
+            keys.remember(0, true);
+            for _ in 0..5 {
+                assert_eq!(keys.existing_decision(0, true), Some(true));
+                assert_eq!(slots.get("app.exe", 0), expected);
+            }
+            assert_eq!(keys.existing_decision(0, false), Some(true));
+        }
     }
 
     #[test]

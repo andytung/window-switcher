@@ -158,14 +158,22 @@ window and press **Ctrl+left Alt+F2** to assign it to F2. Afterwards, press **F1
 or **F2** alone to jump directly to that window. F1 through F24 are supported.
 Right Alt is not an assignment modifier, so AltGr combinations remain available.
 
+Assignment is a toggle: with the assigned window focused, press its
+**Ctrl+left Alt+Fn** shortcut again to clear just that slot. The F-key immediately
+returns to its normal app behavior without closing the window or restarting.
+Assigning a different window still replaces the previous assignment.
+This toggle behavior is available in source builds but is not included in the
+currently linked `v1.19.0-manual-slots.2` preview.
+
 Assignments are per app, not global: Chrome and VS Code can each have their own
 F1 window. Slots use the same app grouping as normal cycling, so browser profiles
 and installed web apps can have separate assignments.
 
 - Nothing is assigned automatically. An unassigned F-key keeps its normal app
   behavior.
-- Assigning an occupied slot replaces only that slot. Other assignments do not
-  move when focus changes, new windows open, or another slot is reassigned.
+- Repeating an assignment for the same window clears only that slot; assigning
+  a different window replaces it. Other assignments do not move when focus
+  changes, new windows open, or another slot is reassigned or cleared.
 - Closing a window loses all its assignments. New windows never inherit them,
   even if Windows reuses the closed window's internal handle.
 - Assignments are kept only in memory. Exiting or restarting Window Switcher
