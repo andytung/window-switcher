@@ -38,7 +38,7 @@ denylist =
 
 ### Download for Windows
 
-Download the [Windows x64 preview ZIP](https://github.com/andytung/window-switcher/releases/download/v1.19.0-manual-slots.2/window-switcher-v1.19.0-manual-slots.2-windows-64.zip)
+Download the [Windows x64 preview ZIP](https://github.com/andytung/window-switcher/releases/download/v1.19.0-manual-slots.3/window-switcher-v1.19.0-manual-slots.3-windows-64.zip)
 from [this repository's releases](https://github.com/andytung/window-switcher/releases).
 **You do not need Git, Rust, or Visual Studio to run it.**
 
@@ -162,8 +162,7 @@ Assignment is a toggle: with the assigned window focused, press its
 **Ctrl+left Alt+Fn** shortcut again to clear just that slot. The F-key immediately
 returns to its normal app behavior without closing the window or restarting.
 Assigning a different window still replaces the previous assignment.
-This toggle behavior is available in source builds but is not included in the
-currently linked `v1.19.0-manual-slots.2` preview.
+Assignment toggling requires preview `v1.19.0-manual-slots.3` or later.
 
 Assignments are per app, not global: Chrome and VS Code can each have their own
 F1 window. Slots use the same app grouping as normal cycling, so browser profiles
